@@ -9,6 +9,11 @@ categories = ["network-programming"]
 repository = "https://github.com/paritytech/yamux"
 edition = "2021"
 
+[features]
+# Exposes `fuzz_header_codec` / `fuzz_connection` for cargo-fuzz harnesses.
+# Not intended for production use.
+fuzzing = []
+
 [dependencies]
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 log = "0.4"

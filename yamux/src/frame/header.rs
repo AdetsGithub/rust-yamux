@@ -398,6 +398,34 @@ pub enum HeaderDecodeError {
     Type(u8),
 }
 
+/// Fuzzing entry point for the Yamux 12-byte frame header codec.
+///
+/// Yamux headers are a fixed-size binary layout:
+/// `[version:u8][type:u8][flags:u16 BE][stream_id:u32 BE][length:u32 BE]`.
+///
+/// Invariants:
+/// - decoding arbitrary 12-byte inputs never panics;
+/// - a successfully decoded header re-encodes to the exact same bytes
+///   (canonical / lossless) and re-parses to an equal value.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_header_codec(data: &[u8]) {
+    if data.len() < HEADER_SIZE {
+        return;
+    }
+    let mut buf = [0u8; HEADER_SIZE];
+    buf.copy_from_slice(&data[..HEADER_SIZE]);
+
+    if let Ok(hdr) = decode(&buf) {
+        let encoded = encode(&hdr);
+        assert_eq!(
+            encoded, buf,
+            "yamux header encode is not a left-inverse of decode"
+        );
+        let reparsed = decode(&encoded).expect("re-decoding an encoded header must succeed");
+        assert_eq!(hdr, reparsed, "yamux header did not survive encode -> decode");
+    }
+}
+
 impl std::fmt::Display for HeaderDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
