@@ -84,6 +84,7 @@ pub fn fuzz_connection_ex(data: &[u8], server: bool, loopback: bool, graceful_cl
         pin::Pin,
         rc::Rc,
         task::{Context, Poll},
+        time::{Duration, Instant},
     };
 
     use futures::{
@@ -158,6 +159,10 @@ pub fn fuzz_connection_ex(data: &[u8], server: bool, loopback: bool, graceful_cl
     // Minimum legal window for MAX_STREAMS (assert in Config setters).
     const MAX_RECV_WINDOW: usize = MAX_STREAMS * DEFAULT_CREDIT as usize;
     const MAX_POLLS: usize = 100_000;
+    // Wall-clock bound so a pathological loopback/credit cycle can't stall a
+    // single unit for minutes (the fuzzer's between-unit -max_total_time check
+    // can't fire while one unit is running).
+    const MAX_DRIVE_TIME: Duration = Duration::from_secs(5);
     // Consecutive no-progress Pending iterations before giving up once the
     // mock is drained (stream wakes won't fire with a noop waker).
     const MAX_IDLE_PENDING: usize = 64;
@@ -194,14 +199,19 @@ pub fn fuzz_connection_ex(data: &[u8], server: bool, loopback: bool, graceful_cl
     let mut open_outbound = !server; // client opens; server mostly accepts
     let mut half_close_budget = 4usize;
     let mut credit_soak_left = CREDIT_SOAK_ROUNDS;
+    let drive_deadline = Instant::now() + MAX_DRIVE_TIME;
 
-    // Drive until idle / error / poll budget, then optionally graceful-close.
+    // Drive until idle / error / poll budget / wall-clock deadline, then
+    // optionally graceful-close.
     //
     // Important: `Closing` is only entered from `ConnectionState::Active` via
     // `poll_close`. Remote GoAway / socket EOF transition Active → Cleanup, so
     // when `graceful_close` is set we must stop *before* `poll_next_inbound`
     // observes EOF (`Ok(0)` on the mock).
     'drive: for poll_i in 0..MAX_POLLS {
+        if Instant::now() >= drive_deadline {
+            break 'drive;
+        }
         let mut progress = false;
         let unread = shared.borrow().q.len();
 
