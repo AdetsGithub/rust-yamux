@@ -99,6 +99,15 @@ pub fn fuzz_connection_ex(data: &[u8], server: bool, loopback: bool, graceful_cl
     struct MockIo {
         buf: Rc<RefCell<SharedBuf>>,
         loopback: bool,
+        /// Remaining bytes this mock may echo back as further remote traffic.
+        ///
+        /// `loopback` echoes local writes into the read buffer to exercise
+        /// ACK / Ping-RTT / WindowUpdate races. Without a hard total budget,
+        /// a write can loop back, grant credit / trigger a response, produce
+        /// another write, and so on forever — keeping [`Connection::poll`]
+        /// spinning inside a single `poll_next_inbound` call, which the
+        /// drive-loop wall-clock deadline cannot interrupt.
+        loopback_budget: usize,
         /// When true, empty reads return `Pending` instead of EOF so the
         /// connection stays `Active` for local [`Connection::poll_close`]
         /// (`closing.rs`). EOF would transition to `Cleanup` instead.
@@ -135,11 +144,14 @@ pub fn fuzz_connection_ex(data: &[u8], server: bool, loopback: bool, graceful_cl
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
             let this = self.get_mut();
-            if this.loopback {
+            if this.loopback && this.loopback_budget > 0 {
                 let mut shared = this.buf.borrow_mut();
                 const MAX_LOOPBACK: usize = 64 * 1024;
-                let room = MAX_LOOPBACK.saturating_sub(shared.q.len());
+                let room = MAX_LOOPBACK
+                    .saturating_sub(shared.q.len())
+                    .min(this.loopback_budget);
                 shared.q.extend(buf.iter().copied().take(room));
+                this.loopback_budget = this.loopback_budget.saturating_sub(room);
             }
             Poll::Ready(Ok(buf.len()))
         }
@@ -156,6 +168,10 @@ pub fn fuzz_connection_ex(data: &[u8], server: bool, loopback: bool, graceful_cl
     const MAX_STREAMS: usize = 100;
     // Cap how many live streams we retain for read/write driving.
     const MAX_HELD_STREAMS: usize = 32;
+    // Total bytes `loopback` may echo back before it stops (hard cap on the
+    // self-echo feedback loop; the per-read-buffer cap above only bounds the
+    // queue depth, not the total volume).
+    const MAX_LOOPBACK_BYTES: usize = 64 * 1024;
     // Minimum legal window for MAX_STREAMS (assert in Config setters).
     const MAX_RECV_WINDOW: usize = MAX_STREAMS * DEFAULT_CREDIT as usize;
     const MAX_POLLS: usize = 100_000;
@@ -185,6 +201,8 @@ pub fn fuzz_connection_ex(data: &[u8], server: bool, loopback: bool, graceful_cl
         MockIo {
             buf: Rc::clone(&shared),
             loopback,
+            // Total echo budget so the loopback feedback loop always drains.
+            loopback_budget: MAX_LOOPBACK_BYTES,
             hold_eof: graceful_close,
         },
         config,
@@ -388,6 +406,27 @@ mod fuzz_closing_tests {
         super::fuzz_connection_ex(&wire, true, true, true);
         // Non-graceful still terminates (EOF → Cleanup).
         super::fuzz_connection_ex(&wire, true, false, false);
+    }
+
+    #[test]
+    fn loopback_echo_bounded_terminates() {
+        // Regression: loopback=true self-echo previously kept
+        // `Connection::poll` spinning forever inside a single
+        // `poll_next_inbound` (window-update/credit feedback), defeating the
+        // drive-loop wall-clock deadline. A total loopback byte budget must
+        // drain the echo so this terminates instead of hanging.
+        //
+        // wire: Data/SYN(stream 1536, len 1) · Data/SYN(stream 16134, len 2)
+        //       · Ping(stream 393216, len 131072, truncated).
+        let wire = [
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x01, 0x08,
+            0x00, 0x00, 0xc3, 0x01, 0x00, 0x00, 0x3f, 0x06, 0x00, 0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x02, 0xec, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x02,
+        ];
+        // server=true, loopback=true, graceful_close=true — the exact
+        // configuration that produced the libFuzzer timeout.
+        super::fuzz_connection_ex(&wire, true, true, true);
     }
 
     #[test]
